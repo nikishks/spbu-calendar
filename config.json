@@ -2,8 +2,8 @@
   "student_group_id": 474266,
   "group_name": "24.Б02",
   "program": "Менеджмент",
-  "subjects": [
-    "Game Theory"
+  "selected_electives": [
+    "Теория игр"
   ],
   "start_date": "2026-09-01",
   "months_ahead": 8,
