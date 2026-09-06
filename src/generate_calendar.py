@@ -11,29 +11,15 @@ from icalendar import Calendar, Event
 
 
 ROOT = Path(__file__).resolve().parents[1]
+
 CONFIG = json.loads(
     (ROOT / "config.json").read_text(encoding="utf-8")
 )
 
 API_EXCEL = "https://timetable.spbu.ru/StudentGroupEvents/ExcelWeek"
-RU_CULTURE_COOKIE = "_culture"
-
-FACULTATIVE_PREFIXES = (
-    "факультатив.",
-    "факультатив ",
-)
-
-ELECTIVE_PREFIX = "электив."
 
 
 def norm(value):
-    """
-    Нормализация текста:
-    - приводит к строке;
-    - убирает неразрывные пробелы;
-    - убирает лишние пробелы;
-    - приводит к нижнему регистру.
-    """
     value = str(value or "")
     value = value.replace("\xa0", " ")
     value = value.strip().lower()
@@ -41,62 +27,15 @@ def norm(value):
     return value
 
 
-def is_facultative(subject):
+def is_selected_subject(subject):
     """
-    Определяет факультатив.
-    Например:
-    'Факультатив. ...'
-    'Факультатив ...'
-    """
-    s = norm(subject)
-
-    return any(
-        s.startswith(prefix)
-        for prefix in FACULTATIVE_PREFIXES
-    )
-
-
-def is_selected_elective(subject):
-    """
-    Оставляет только выбранные пользователем элективы.
-
-    Сейчас выбран:
-    - Теория игр
-
-    Поэтому:
-    'Электив. Теория игр' -> True
-    'Электив. Управление конфликтами' -> False
-    """
-
-    s = norm(subject)
-
-    if not s.startswith(ELECTIVE_PREFIX):
-        return False
-
-    elective_name = s[len(ELECTIVE_PREFIX):].strip()
-
-    selected = CONFIG.get("selected_electives", [])
-
-    for item in selected:
-        selected_name = norm(item)
-
-        if elective_name == selected_name:
-            return True
-
-    return False
-
-
-def selected(subject):
-    """
-    Главный фильтр расписания.
-
     Оставляем:
-    1. Все обычные предметы.
-    2. Выбранные элективы.
+    - все обычные предметы;
+    - только выбранный электив "Теория игр".
 
     Убираем:
-    1. Все остальные элективы.
-    2. Все факультативы.
+    - все остальные элективы;
+    - все факультативы.
     """
 
     s = norm(subject)
@@ -104,16 +43,24 @@ def selected(subject):
     if not s:
         return False
 
-    # Факультативы полностью исключаем.
-    if is_facultative(s):
+    # Факультативы никогда не добавляем.
+    if s.startswith("факультатив"):
         return False
 
-    # Если это электив —
-    # оставляем только выбранный.
-    if s.startswith(ELECTIVE_PREFIX):
-        return is_selected_elective(s)
+    # Элективы:
+    if s.startswith("электив"):
+        selected_electives = [
+            norm(x)
+            for x in CONFIG.get("selected_electives", [])
+        ]
 
-    # Всё остальное оставляем.
+        for elective in selected_electives:
+            if elective in s:
+                return True
+
+        return False
+
+    # Всё остальное — обычные предметы.
     return True
 
 
@@ -121,7 +68,7 @@ def get_sheet(group_id, monday):
     session = requests.Session()
 
     session.cookies.set(
-        RU_CULTURE_COOKIE,
+        "_culture",
         "ru",
         domain="timetable.spbu.ru"
     )
@@ -142,24 +89,149 @@ def get_sheet(group_id, monday):
         data_only=True
     )
 
-    sheet_name = "Расписание студенческой группы"
-
-    if sheet_name not in workbook.sheetnames:
+    if not workbook.sheetnames:
         raise RuntimeError(
-            "СПбГУ не вернул лист "
-            "'Расписание студенческой группы'. "
-            f"Получены листы: {workbook.sheetnames}"
+            "СПбГУ вернул Excel без листов."
         )
 
-    return workbook[sheet_name]
+    # Берём первый лист, потому что название листа
+    # может меняться в разных версиях выгрузки.
+    return workbook[workbook.sheetnames[0]]
 
 
-def parse_sheet(sheet):
-    rows = []
+def parse_time(value):
+    if not value:
+        return None
+
+    value = str(value)
+    value = value.replace("—", "-")
+    value = value.replace("–", "-")
+    value = value.strip()
+
+    parts = [
+        x.strip()
+        for x in value.split("-")
+    ]
+
+    if len(parts) != 2:
+        return None
+
+    try:
+        start = datetime.strptime(
+            parts[0],
+            "%H:%M"
+        ).time()
+
+        end = datetime.strptime(
+            parts[1],
+            "%H:%M"
+        ).time()
+
+        return start, end
+
+    except ValueError:
+        return None
+
+
+def parse_day(value, monday):
+    """
+    СПбГУ может отдавать:
+
+        вторник
+        8 сентября
+
+    Поэтому дата не берётся из ячейки напрямую.
+
+    День недели + номер дня позволяют получить
+    реальную дату относительно недели.
+    """
+
+    if not value:
+        return None
+
+    text = str(value)
+    text = text.replace("\n", " ")
+    text = norm(text)
+
+    weekdays = {
+        "понедельник": 0,
+        "вторник": 1,
+        "среда": 2,
+        "четверг": 3,
+        "пятница": 4,
+        "суббота": 5,
+        "воскресенье": 6,
+    }
+
+    weekday = None
+
+    for name, number in weekdays.items():
+        if name in text:
+            weekday = number
+            break
+
+    if weekday is None:
+        return None
+
+    match = re.search(
+        r"\b(\d{1,2})\s+(января|февраля|марта|апреля|мая|июня|июля|августа|сентября|октября|ноября|декабря)\b",
+        text
+    )
+
+    if not match:
+        return None
+
+    day = int(match.group(1))
+
+    months = {
+        "января": 1,
+        "февраля": 2,
+        "марта": 3,
+        "апреля": 4,
+        "мая": 5,
+        "июня": 6,
+        "июля": 7,
+        "августа": 8,
+        "сентября": 9,
+        "октября": 10,
+        "ноября": 11,
+        "декабря": 12,
+    }
+
+    month = months[match.group(2)]
+
+    # Определяем год из понедельника недели.
+    year = monday.year
+
+    # Если неделя пересекает Новый год.
+    if month == 1 and monday.month == 12:
+        year += 1
+
+    try:
+        result = date(
+            year,
+            month,
+            day
+        )
+    except ValueError:
+        return None
+
+    # Дополнительная проверка.
+    # Дата должна соответствовать нужному дню недели.
+    if result.weekday() != weekday:
+        return None
+
+    return result
+
+
+def parse_sheet(sheet, monday):
+    result = []
+
+    current_day = None
 
     for row in sheet.iter_rows(
-        min_row=5,
-        max_row=300,
+        min_row=1,
+        max_row=500,
         max_col=5
     ):
         values = []
@@ -169,96 +241,66 @@ def parse_sheet(sheet):
 
             if value is not None:
                 value = str(value)
-                value = value.replace("\n", " ")
+                value = value.replace("\xa0", " ")
                 value = value.strip()
 
             values.append(value)
 
-        if any(values):
-            rows.append(values)
-
-    last_day = None
-    result = []
-
-    for row in rows:
-
-        # Первый столбец содержит дату.
-        # В следующих строках дата может быть пустой,
-        # поэтому сохраняем последнюю найденную дату.
-        if row[0]:
-            last_day = row[0]
-
-        if len(row) < 5:
+        if not any(values):
             continue
 
-        if not row[1] or not row[2]:
-            continue
+        first = values[0] or ""
 
-        if not last_day:
-            continue
-
-        # Ищем дату вида:
-        # 08.09.2026
-        date_match = re.search(
-            r"(\d{2}\.\d{2}\.\d{4})",
-            last_day
+        # Если в первой ячейке указан день,
+        # запоминаем его для следующих строк.
+        parsed_day = parse_day(
+            first,
+            monday
         )
 
-        if not date_match:
+        if parsed_day:
+            current_day = parsed_day
+
+        # Структура:
+        # 0 — день
+        # 1 — время
+        # 2 — название
+        # 3 — место
+        # 4 — преподаватель
+
+        if not current_day:
             continue
 
-        try:
-            event_date = datetime.strptime(
-                date_match.group(1),
-                "%d.%m.%Y"
-            ).date()
-        except ValueError:
+        if len(values) < 5:
             continue
 
-        # Время.
-        time_string = str(row[1])
+        time_value = values[1]
+        subject = values[2]
 
-        time_string = (
-            time_string
-            .replace("—", "–")
-            .replace("-", "–")
+        if not time_value or not subject:
+            continue
+
+        parsed_time = parse_time(
+            time_value
         )
 
-        parts = [
-            part.strip()
-            for part in time_string.split("–")
-        ]
-
-        if len(parts) != 2:
+        if not parsed_time:
             continue
 
-        try:
-            start_time = datetime.strptime(
-                parts[0],
-                "%H:%M"
-            ).time()
+        start, end = parsed_time
 
-            end_time = datetime.strptime(
-                parts[1],
-                "%H:%M"
-            ).time()
-
-        except ValueError:
+        # Фильтрация предметов.
+        if not is_selected_subject(subject):
             continue
 
-        subject = row[2] or ""
-        place = row[3] or ""
-        lecturer = row[4] or ""
-
-        # Главный фильтр.
-        if not selected(subject):
-            continue
+        place = values[3] or ""
+        lecturer = values[4] or ""
 
         result.append(
             (
-                event_date,
-                start_time,
-                end_time,
+                current_day,
+                start,
+                end,
                 subject,
                 place,
                 lecturer
@@ -268,40 +310,37 @@ def parse_sheet(sheet):
     return result
 
 
-def monday_on_or_before(current_date):
-    return current_date - timedelta(
-        days=current_date.weekday()
+def monday_on_or_before(d):
+    return d - timedelta(
+        days=d.weekday()
     )
 
 
 def load_schedule():
-
     group_id = int(
         CONFIG["student_group_id"]
     )
 
-    if group_id <= 0:
-        raise SystemExit(
-            "Укажи student_group_id в config.json."
-        )
-
-    start_date = date.fromisoformat(
+    start = date.fromisoformat(
         CONFIG["start_date"]
     )
 
-    end_date = start_date + timedelta(
+    end = start + timedelta(
         days=30 * int(
-            CONFIG.get("months_ahead", 8)
+            CONFIG.get(
+                "months_ahead",
+                8
+            )
         )
     )
 
     monday = monday_on_or_before(
-        start_date
+        start
     )
 
     all_events = []
 
-    while monday <= end_date:
+    while monday <= end:
 
         print(
             f"Загрузка недели: {monday}"
@@ -312,7 +351,10 @@ def load_schedule():
             monday
         )
 
-        week_events = parse_sheet(sheet)
+        week_events = parse_sheet(
+            sheet,
+            monday
+        )
 
         print(
             f"Найдено подходящих занятий: "
@@ -323,28 +365,27 @@ def load_schedule():
             week_events
         )
 
-        monday += timedelta(days=7)
+        monday += timedelta(
+            days=7
+        )
 
     # Убираем дубликаты.
-    unique_events = {}
+    unique = {}
 
     for event in all_events:
-        unique_events[event] = event
+        unique[event] = event
 
-    events = sorted(
-        unique_events.values(),
-        key=lambda event: (
-            event[0],
-            event[1],
-            event[3]
+    return sorted(
+        unique.values(),
+        key=lambda x: (
+            x[0],
+            x[1],
+            x[3]
         )
     )
 
-    return events
-
 
 def make_ics(events):
-
     timezone_name = CONFIG.get(
         "timezone",
         "Europe/Moscow"
@@ -364,6 +405,16 @@ def make_ics(events):
     calendar.add(
         "version",
         "2.0"
+    )
+
+    calendar.add(
+        "CALSCALE",
+        "GREGORIAN"
+    )
+
+    calendar.add(
+        "METHOD",
+        "PUBLISH"
     )
 
     calendar.add(
@@ -387,20 +438,10 @@ def make_ics(events):
         timezone_name
     )
 
-    calendar.add(
-        "CALSCALE",
-        "GREGORIAN"
-    )
-
-    calendar.add(
-        "METHOD",
-        "PUBLISH"
-    )
-
     for (
         event_date,
-        start_time,
-        end_time,
+        start,
+        end,
         subject,
         place,
         lecturer
@@ -408,22 +449,21 @@ def make_ics(events):
 
         event = Event()
 
-        start_datetime = datetime.combine(
+        start_dt = datetime.combine(
             event_date,
-            start_time,
+            start,
             tzinfo=timezone
         )
 
-        end_datetime = datetime.combine(
+        end_dt = datetime.combine(
             event_date,
-            end_time,
+            end,
             tzinfo=timezone
         )
 
         uid_base = (
             f"{event_date.isoformat()}-"
-            f"{start_time}-"
-            f"{end_time}-"
+            f"{start}-{end}-"
             f"{subject}-"
             f"{place}-"
             f"{lecturer}"
@@ -435,7 +475,7 @@ def make_ics(events):
                 "-",
                 uid_base
             ).strip("-")
-            + "@spbu-apple-calendar"
+            + "@spbu-calendar"
         )
 
         event.add(
@@ -450,12 +490,12 @@ def make_ics(events):
 
         event.add(
             "dtstart",
-            start_datetime
+            start_dt
         )
 
         event.add(
             "dtend",
-            end_datetime
+            end_dt
         )
 
         event.add(
@@ -490,13 +530,14 @@ def make_ics(events):
                 place
             )
 
-        calendar.add_component(event)
+        calendar.add_component(
+            event
+        )
 
     return calendar.to_ical()
 
 
 def main():
-
     events = load_schedule()
 
     output = (
