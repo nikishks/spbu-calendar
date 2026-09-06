@@ -1,0 +1,13 @@
+{
+  "student_group_id": 474266,
+  "group_name": "24.Б02",
+  "program": "Менеджмент",
+  "subjects": [
+    "Game Theory"
+  ],
+  "start_date": "2026-09-01",
+  "months_ahead": 8,
+  "timezone": "Europe/Moscow",
+  "calendar_name": "СПбГУ — 24.Б02",
+  "calendar_description": "Расписание СПбГУ, группа 24.Б02"
+}
