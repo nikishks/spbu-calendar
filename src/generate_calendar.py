@@ -224,88 +224,119 @@ def parse_day(value, monday):
     return result
 
 
-def parse_sheet(sheet, monday):
-    result = []
+def parse_sheet(sheet):
 
-    current_day = None
+    rows = []
 
-    for row in sheet.iter_rows(
-        min_row=1,
-        max_row=500,
-        max_col=5
-    ):
+    for row in sheet.iter_rows(min_row=5, max_row=300, max_col=5):
+
         values = []
 
-        for cell in row:
-            value = cell.value
+        # Если хотя бы одна существенная ячейка занятия зачёркнута,
 
-            if value is not None:
-                value = str(value)
-                value = value.replace("\xa0", " ")
-                value = value.strip()
+        # считаем занятие отменённым.
 
-            values.append(value)
+        cancelled = any(
 
-        if not any(values):
-            continue
+            bool(c.font.strike)
 
-        first = values[0] or ""
+            for c in row[1:5]
 
-        # Если в первой ячейке указан день,
-        # запоминаем его для следующих строк.
-        parsed_day = parse_day(
-            first,
-            monday
+            if c.value is not None
+
         )
 
-        if parsed_day:
-            current_day = parsed_day
+        for c in row:
 
-        # Структура:
-        # 0 — день
-        # 1 — время
-        # 2 — название
-        # 3 — место
-        # 4 — преподаватель
+            v = c.value
 
-        if not current_day:
-            continue
+            values.append(
 
-        if len(values) < 5:
-            continue
+                str(v).replace("\n", " ").strip()
 
-        time_value = values[1]
-        subject = values[2]
+                if v is not None
 
-        if not time_value or not subject:
-            continue
+                else None
 
-        parsed_time = parse_time(
-            time_value
-        )
-
-        if not parsed_time:
-            continue
-
-        start, end = parsed_time
-
-        # Фильтрация предметов.
-        if not is_selected_subject(subject):
-            continue
-
-        place = values[3] or ""
-        lecturer = values[4] or ""
-
-        result.append(
-            (
-                current_day,
-                start,
-                end,
-                subject,
-                place,
-                lecturer
             )
-        )
+
+        if any(values):
+
+            rows.append((values, cancelled))
+
+    last_day = None
+
+    result = []
+
+    for row, cancelled in rows:
+
+        if row[0]:
+
+            last_day = row[0]
+
+        if len(row) < 5 or not row[1] or not row[2]:
+
+            continue
+
+        if not last_day:
+
+            continue
+
+        # Отменённую пару в календарь не добавляем
+
+        if cancelled:
+
+            print(f"Пропускаю отменённое занятие: {row[2]}")
+
+            continue
+
+        # Example: "Понедельник 07.09.2026"
+
+        m = re.search(r"(\d{2}\.\d{2}\.\d{4})", last_day)
+
+        if not m:
+
+            continue
+
+        try:
+
+            d = datetime.strptime(m.group(1), "%d.%m.%Y").date()
+
+        except ValueError:
+
+            continue
+
+        tm = str(row[1]).replace("—", "–").replace("-", "–")
+
+        parts = [x.strip() for x in tm.split("–")]
+
+        if len(parts) != 2:
+
+            continue
+
+        try:
+
+            start = datetime.strptime(parts[0], "%H:%M").time()
+
+            end = datetime.strptime(parts[1], "%H:%M").time()
+
+        except ValueError:
+
+            continue
+
+        subject = row[2] or ""
+
+        place = row[3] or ""
+
+        lecturer = row[4] or ""
+
+        if selected(subject):
+
+            result.append(
+
+                (d, start, end, subject, place, lecturer)
+
+            )
 
     return result
 
