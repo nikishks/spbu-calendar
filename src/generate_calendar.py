@@ -1,14 +1,16 @@
 import json
 import re
-from datetime import datetime, date, timedelta
-from io import BytesIO
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import requests
-import openpyxl
 from icalendar import Calendar, Event
 
+
+# ============================================================
+# CONFIG
+# ============================================================
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -16,10 +18,17 @@ CONFIG = json.loads(
     (ROOT / "config.json").read_text(encoding="utf-8")
 )
 
-API_EXCEL = "https://timetable.spbu.ru/StudentGroupEvents/ExcelWeek"
+API_BASE = "https://timetable.spbu.ru/api/v1"
 
+
+# ============================================================
+# HELPERS
+# ============================================================
 
 def norm(value):
+    """
+    Нормализация текста для сравнений.
+    """
     value = str(value or "")
     value = value.replace("\xa0", " ")
     value = value.strip().lower()
@@ -27,442 +36,898 @@ def norm(value):
     return value
 
 
-def is_selected_subject(subject):
+def get_value(obj, *names, default=None):
     """
-    Оставляем:
-    - все обычные предметы;
-    - только выбранные элективы.
+    Получить значение независимо от регистра ключа.
 
-    Убираем:
-    - все остальные элективы;
-    - все факультативы.
+    Например:
+        IsCancelled
+        isCancelled
+        ISCancelled
+
+    будут найдены одинаково.
+    """
+    if not isinstance(obj, dict):
+        return default
+
+    for name in names:
+        if name in obj:
+            return obj[name]
+
+    lowered = {
+        str(key).lower(): value
+        for key, value in obj.items()
+    }
+
+    for name in names:
+        key = name.lower()
+
+        if key in lowered:
+            return lowered[key]
+
+    return default
+
+
+# ============================================================
+# SUBJECT FILTER
+# ============================================================
+
+def is_selected_subject(subject, api_event=None):
+    """
+    Обычные предметы добавляем.
+
+    Факультативы не добавляем.
+
+    Если событие является элективом, добавляем только
+    выбранные элективы из config.json.
     """
 
-    s = norm(subject)
+    subject_norm = norm(subject)
 
-    if not s:
+    if not subject_norm:
         return False
 
-    # Факультативы никогда не добавляем.
-    if s.startswith("факультатив"):
+    # --------------------------------------------
+    # ФАКУЛЬТАТИВЫ
+    # --------------------------------------------
+
+    if subject_norm.startswith("факультатив"):
         return False
 
-    # Элективы.
-    if s.startswith("электив"):
-        selected_electives = [
+    # --------------------------------------------
+    # ЭЛЕКТИВ
+    # --------------------------------------------
+
+    is_elective = False
+
+    if isinstance(api_event, dict):
+        is_elective = bool(
+            get_value(
+                api_event,
+                "IsElective",
+                "isElective",
+                default=False,
+            )
+        )
+
+    # На случай если API почему-то не выставил IsElective,
+    # сохраняем поддержку старого формата названий.
+    if subject_norm.startswith("электив"):
+        is_elective = True
+
+    if is_elective:
+        selected = [
             norm(x)
-            for x in CONFIG.get("selected_electives", [])
+            for x in CONFIG.get(
+                "selected_electives",
+                []
+            )
         ]
 
-        for elective in selected_electives:
-            if elective in s:
+        for elective in selected:
+            if not elective:
+                continue
+
+            # Поддерживаем оба варианта:
+            #
+            # config: "Теория игр"
+            # subject: "Теория игр"
+            #
+            # или:
+            #
+            # subject: "Электив. Теория игр"
+            if (
+                elective in subject_norm
+                or subject_norm in elective
+            ):
                 return True
 
         return False
 
-    # Всё остальное — обычные предметы.
     return True
 
 
-def get_sheet(group_id, monday):
-    session = requests.Session()
+# ============================================================
+# DATE PARSING
+# ============================================================
 
-    session.cookies.set(
-        "_culture",
-        "ru",
-        domain="timetable.spbu.ru"
+def parse_api_datetime(value):
+    """
+    API СПбГУ в разные периоды мог возвращать дату
+    в разных форматах.
+
+    Поддерживаем:
+        2026-09-12T10:00:00
+        2026-09-12T10:00:00+03:00
+        2026-09-12T10:00:00Z
+        /Date(1789196400000)/
+    """
+
+    if value is None:
+        return None
+
+    # Уже datetime
+    if isinstance(value, datetime):
+        return value
+
+    text = str(value).strip()
+
+    if not text:
+        return None
+
+    # --------------------------------------------
+    # Microsoft JSON date:
+    # /Date(1789196400000)/
+    # --------------------------------------------
+
+    match = re.search(
+        r"/Date\((-?\d+)",
+        text
     )
 
-    response = session.get(
-        API_EXCEL,
+    if match:
+        try:
+            timestamp_ms = int(
+                match.group(1)
+            )
+
+            return datetime.fromtimestamp(
+                timestamp_ms / 1000,
+                tz=ZoneInfo(
+                    CONFIG.get(
+                        "timezone",
+                        "Europe/Moscow"
+                    )
+                ),
+            )
+
+        except (
+            ValueError,
+            OverflowError
+        ):
+            return None
+
+    # --------------------------------------------
+    # ISO
+    # --------------------------------------------
+
+    iso_text = text
+
+    if iso_text.endswith("Z"):
+        iso_text = (
+            iso_text[:-1]
+            + "+00:00"
+        )
+
+    try:
+        return datetime.fromisoformat(
+            iso_text
+        )
+    except ValueError:
+        pass
+
+    # --------------------------------------------
+    # Дополнительные форматы
+    # --------------------------------------------
+
+    formats = [
+        "%Y-%m-%dT%H:%M:%S",
+        "%Y-%m-%d %H:%M:%S",
+        "%Y-%m-%dT%H:%M",
+        "%Y-%m-%d %H:%M",
+        "%d.%m.%Y %H:%M",
+    ]
+
+    for fmt in formats:
+        try:
+            return datetime.strptime(
+                text,
+                fmt
+            )
+        except ValueError:
+            continue
+
+    return None
+
+
+def localize_datetime(value):
+    """
+    Привести datetime к timezone из config.json.
+    """
+
+    if value is None:
+        return None
+
+    timezone = ZoneInfo(
+        CONFIG.get(
+            "timezone",
+            "Europe/Moscow"
+        )
+    )
+
+    if value.tzinfo is None:
+        return value.replace(
+            tzinfo=timezone
+        )
+
+    return value.astimezone(
+        timezone
+    )
+
+
+# ============================================================
+# API EVENT DISCOVERY
+# ============================================================
+
+def looks_like_event(obj):
+    """
+    API может вернуть события внутри:
+        Days
+        DayStudyEvents
+        Events
+        и т.д.
+
+    Поэтому не привязываемся жёстко к оболочке JSON.
+
+    Событием считаем словарь, содержащий как минимум:
+        Subject
+        Start
+        End
+    """
+
+    if not isinstance(obj, dict):
+        return False
+
+    subject = get_value(
+        obj,
+        "Subject"
+    )
+
+    start = get_value(
+        obj,
+        "Start"
+    )
+
+    end = get_value(
+        obj,
+        "End"
+    )
+
+    return (
+        subject is not None
+        and start is not None
+        and end is not None
+    )
+
+
+def find_events_recursive(data):
+    """
+    Рекурсивно найти все события в JSON API.
+
+    Это делает код устойчивым к изменению внешней
+    структуры ответа API.
+    """
+
+    found = []
+
+    if isinstance(data, dict):
+
+        if looks_like_event(data):
+            found.append(data)
+
+        for value in data.values():
+            found.extend(
+                find_events_recursive(
+                    value
+                )
+            )
+
+    elif isinstance(data, list):
+
+        for item in data:
+            found.extend(
+                find_events_recursive(
+                    item
+                )
+            )
+
+    return found
+
+
+# ============================================================
+# LOCATION / EDUCATOR
+# ============================================================
+
+def extract_location(event):
+    """
+    Основной текст аудитории API обычно уже отдаёт
+    в LocationsDisplayText.
+    """
+
+    value = get_value(
+        event,
+        "LocationsDisplayText",
+        "locationsDisplayText",
+    )
+
+    if value:
+        return str(value).strip()
+
+    # Fallback на EventLocations
+    locations = get_value(
+        event,
+        "EventLocations",
+        "eventLocations",
+        default=[],
+    )
+
+    result = []
+
+    if isinstance(locations, list):
+
+        for location in locations:
+
+            if not isinstance(
+                location,
+                dict
+            ):
+                continue
+
+            # Пробуем распространённые поля.
+            pieces = []
+
+            for key in (
+                "DisplayName",
+                "LocationDisplayName",
+                "Room",
+                "RoomName",
+                "Address",
+            ):
+                value = get_value(
+                    location,
+                    key
+                )
+
+                if (
+                    value
+                    and str(value).strip()
+                    not in pieces
+                ):
+                    pieces.append(
+                        str(value).strip()
+                    )
+
+            if pieces:
+                result.append(
+                    ", ".join(pieces)
+                )
+
+    return "; ".join(result)
+
+
+def extract_educator(event):
+    """
+    Имя преподавателя.
+    """
+
+    value = get_value(
+        event,
+        "EducatorsDisplayText",
+        "educatorsDisplayText",
+    )
+
+    if value:
+        return str(value).strip()
+
+    educators = get_value(
+        event,
+        "EducatorIds",
+        "Educators",
+        "educators",
+        default=[],
+    )
+
+    result = []
+
+    if isinstance(educators, list):
+
+        for educator in educators:
+
+            if not isinstance(
+                educator,
+                dict
+            ):
+                continue
+
+            name = get_value(
+                educator,
+                "DisplayName",
+                "FullName",
+                "Name",
+            )
+
+            if name:
+                result.append(
+                    str(name).strip()
+                )
+
+    return ", ".join(result)
+
+
+# ============================================================
+# API
+# ============================================================
+
+def make_api_date(dt):
+    """
+    Формат API:
+        YYYYMMDDHHMM
+    """
+
+    return dt.strftime(
+        "%Y%m%d%H%M"
+    )
+
+
+def get_api_events(
+    group_id,
+    start_date,
+    end_date
+):
+    """
+    Получить события группы через официальный API СПбГУ.
+    """
+
+    timezone = ZoneInfo(
+        CONFIG.get(
+            "timezone",
+            "Europe/Moscow"
+        )
+    )
+
+    start_dt = datetime.combine(
+        start_date,
+        datetime.min.time(),
+        tzinfo=timezone,
+    )
+
+    end_dt = datetime.combine(
+        end_date,
+        datetime.max.time(),
+        tzinfo=timezone,
+    )
+
+    from_string = make_api_date(
+        start_dt
+    )
+
+    to_string = make_api_date(
+        end_dt
+    )
+
+    url = (
+        f"{API_BASE}/groups/"
+        f"{group_id}/events/"
+        f"{from_string}/"
+        f"{to_string}"
+    )
+
+    print()
+    print(
+        "Запрос API:"
+    )
+    print(
+        f"  {start_date} — {end_date}"
+    )
+
+    response = requests.get(
+        url,
         params={
-            "studentGroupId": group_id,
-            "weekMonday": monday.isoformat()
+            "timetable": "Primary"
+        },
+        headers={
+            "Accept": "application/json",
+            "User-Agent": (
+                "spbu-calendar/2.0 "
+                "(GitHub Actions)"
+            ),
         },
         timeout=60,
     )
 
     response.raise_for_status()
 
-    workbook = openpyxl.load_workbook(
-        BytesIO(response.content),
-        data_only=True
-    )
+    try:
+        data = response.json()
 
-    if not workbook.sheetnames:
+    except ValueError as exc:
+        print(
+            "Ответ API не является JSON:"
+        )
+
+        print(
+            response.text[:1000]
+        )
+
         raise RuntimeError(
-            "СПбГУ вернул Excel без листов."
-        )
+            "СПбГУ API вернул некорректный JSON"
+        ) from exc
 
-    return workbook[workbook.sheetnames[0]]
-
-
-def parse_time(value):
-    if not value:
-        return None
-
-    value = str(value)
-    value = value.replace("—", "-")
-    value = value.replace("–", "-")
-    value = value.strip()
-
-    parts = [
-        x.strip()
-        for x in value.split("-")
-    ]
-
-    if len(parts) != 2:
-        return None
-
-    try:
-        start = datetime.strptime(
-            parts[0],
-            "%H:%M"
-        ).time()
-
-        end = datetime.strptime(
-            parts[1],
-            "%H:%M"
-        ).time()
-
-        return start, end
-
-    except ValueError:
-        return None
-
-
-def parse_day(value, monday):
-    """
-    СПбГУ может отдавать:
-
-        вторник
-        8 сентября
-
-    Поэтому дата определяется относительно недели.
-    """
-
-    if not value:
-        return None
-
-    text = str(value)
-    text = text.replace("\n", " ")
-    text = norm(text)
-
-    weekdays = {
-        "понедельник": 0,
-        "вторник": 1,
-        "среда": 2,
-        "четверг": 3,
-        "пятница": 4,
-        "суббота": 5,
-        "воскресенье": 6,
-    }
-
-    weekday = None
-
-    for name, number in weekdays.items():
-        if name in text:
-            weekday = number
-            break
-
-    if weekday is None:
-        return None
-
-    match = re.search(
-        r"\b(\d{1,2})\s+"
-        r"(января|февраля|марта|апреля|мая|июня|"
-        r"июля|августа|сентября|октября|ноября|декабря)\b",
-        text
+    events = find_events_recursive(
+        data
     )
 
-    if not match:
-        return None
+    print(
+        f"API вернул событий: "
+        f"{len(events)}"
+    )
 
-    day = int(match.group(1))
+    return events
 
-    months = {
-        "января": 1,
-        "февраля": 2,
-        "марта": 3,
-        "апреля": 4,
-        "мая": 5,
-        "июня": 6,
-        "июля": 7,
-        "августа": 8,
-        "сентября": 9,
-        "октября": 10,
-        "ноября": 11,
-        "декабря": 12,
-    }
 
-    month = months[match.group(2)]
+# ============================================================
+# EVENT PARSING
+# ============================================================
 
-    year = monday.year
+def parse_api_event(event):
+    """
+    Преобразовать событие СПбГУ во внутренний формат.
 
-    # Если неделя пересекает Новый год.
-    if month == 1 and monday.month == 12:
-        year += 1
+    Возвращает None, если событие:
+        - отменено;
+        - не подходит по фильтру;
+        - имеет некорректные даты.
+    """
 
-    try:
-        result = date(
-            year,
-            month,
-            day
+    subject = str(
+        get_value(
+            event,
+            "Subject",
+            default="",
         )
-    except ValueError:
+        or ""
+    ).strip()
+
+    if not subject:
         return None
 
-    # Проверяем, что дата соответствует дню недели.
-    if result.weekday() != weekday:
+    # ========================================================
+    # ГЛАВНАЯ ПРОВЕРКА:
+    # ОТМЕНЁННОЕ ЗАНЯТИЕ
+    # ========================================================
+
+    is_cancelled = bool(
+        get_value(
+            event,
+            "IsCancelled",
+            "isCancelled",
+            default=False,
+        )
+    )
+
+    start_raw = get_value(
+        event,
+        "Start"
+    )
+
+    end_raw = get_value(
+        event,
+        "End"
+    )
+
+    start_dt = localize_datetime(
+        parse_api_datetime(
+            start_raw
+        )
+    )
+
+    end_dt = localize_datetime(
+        parse_api_datetime(
+            end_raw
+        )
+    )
+
+    if is_cancelled:
+
+        if start_dt:
+            event_time = (
+                start_dt.strftime(
+                    "%d.%m.%Y %H:%M"
+                )
+            )
+        else:
+            event_time = str(
+                start_raw or ""
+            )
+
+        print(
+            "ОТМЕНЕНО -> пропускаю:"
+        )
+
+        print(
+            f"  {event_time} — "
+            f"{subject}"
+        )
+
         return None
 
-    return result
+    # ========================================================
+    # SUBJECT FILTER
+    # ========================================================
 
-
-def cell_is_struck(cell):
-    """
-    Возвращает True, если текст в ячейке Excel зачёркнут.
-    """
-
-    try:
-        return bool(cell.font and cell.font.strike)
-    except Exception:
-        return False
-
-
-def row_is_cancelled(row):
-    """
-    СПбГУ отмечает отменённые занятия зачёркиванием.
-
-    Проверяем время, название, аудиторию и преподавателя.
-    Первая колонка содержит день недели, поэтому её не учитываем.
-    """
-
-    important_cells = row[1:5]
-
-    for cell in important_cells:
-        if cell.value is None:
-            continue
-
-        if cell_is_struck(cell):
-            return True
-
-    return False
-
-
-def parse_sheet(sheet, monday):
-    result = []
-
-    current_day = None
-
-    for row in sheet.iter_rows(
-        min_row=1,
-        max_row=500,
-        max_col=5
+    if not is_selected_subject(
+        subject,
+        event
     ):
-        values = []
+        return None
 
-        for cell in row:
-            value = cell.value
+    # ========================================================
+    # TIME
+    # ========================================================
 
-            if value is not None:
-                value = str(value)
-                value = value.replace("\xa0", " ")
-                value = value.strip()
-
-            values.append(value)
-
-        if not any(values):
-            continue
-
-        first = values[0] or ""
-
-        # Если в первой ячейке указан день,
-        # запоминаем его для следующих строк.
-        parsed_day = parse_day(
-            first,
-            monday
+    if (
+        start_dt is None
+        or end_dt is None
+    ):
+        print(
+            "Не удалось разобрать время:"
         )
 
-        if parsed_day:
-            current_day = parsed_day
-
-        # Структура:
-        # 0 — день
-        # 1 — время
-        # 2 — название
-        # 3 — место
-        # 4 — преподаватель
-
-        if not current_day:
-            continue
-
-        if len(values) < 5:
-            continue
-
-        time_value = values[1]
-        subject = values[2]
-
-        if not time_value or not subject:
-            continue
-
-        parsed_time = parse_time(
-            time_value
+        print(
+            f"  {subject}"
         )
 
-        if not parsed_time:
-            continue
-
-        start, end = parsed_time
-
-        # ----------------------------------------
-        # ПРОВЕРКА НА ОТМЕНУ
-        # ----------------------------------------
-
-        if row_is_cancelled(row):
-            print(
-                "Отменённое занятие пропущено: "
-                f"{current_day} "
-                f"{start.strftime('%H:%M')} "
-                f"{subject}"
-            )
-            continue
-
-        # ----------------------------------------
-        # ФИЛЬТРАЦИЯ ПРЕДМЕТОВ
-        # ----------------------------------------
-
-        if not is_selected_subject(subject):
-            continue
-
-        place = values[3] or ""
-        lecturer = values[4] or ""
-
-        result.append(
-            (
-                current_day,
-                start,
-                end,
-                subject,
-                place,
-                lecturer
-            )
+        print(
+            f"  Start={start_raw}"
         )
 
-    return result
+        print(
+            f"  End={end_raw}"
+        )
 
+        return None
 
-def monday_on_or_before(d):
-    return d - timedelta(
-        days=d.weekday()
+    # ========================================================
+    # ALL-DAY
+    # ========================================================
+
+    all_day = bool(
+        get_value(
+            event,
+            "AllDay",
+            "allDay",
+            default=False,
+        )
     )
 
+    # Для нашего учебного календаря события без
+    # конкретного времени пока пропускаем.
+    if all_day:
+        print(
+            "All-day событие пропущено:"
+        )
+
+        print(
+            f"  {subject}"
+        )
+
+        return None
+
+    location = extract_location(
+        event
+    )
+
+    educator = extract_educator(
+        event
+    )
+
+    return {
+        "start": start_dt,
+        "end": end_dt,
+        "subject": subject,
+        "location": location,
+        "educator": educator,
+
+        "time_was_changed": bool(
+            get_value(
+                event,
+                "TimeWasChanged",
+                default=False,
+            )
+        ),
+
+        "location_was_changed": bool(
+            get_value(
+                event,
+                "LocationsWereChanged",
+                default=False,
+            )
+        ),
+
+        "educator_was_changed": bool(
+            get_value(
+                event,
+                "EducatorsWereReassigned",
+                default=False,
+            )
+        ),
+    }
+
+
+# ============================================================
+# LOAD SCHEDULE
+# ============================================================
 
 def load_schedule():
     group_id = int(
-        CONFIG["student_group_id"]
+        CONFIG[
+            "student_group_id"
+        ]
     )
 
-    start = date.fromisoformat(
-        CONFIG["start_date"]
+    start_date = date.fromisoformat(
+        CONFIG[
+            "start_date"
+        ]
     )
 
-    end = start + timedelta(
-        days=30 * int(
-            CONFIG.get(
-                "months_ahead",
-                8
-            )
+    months_ahead = int(
+        CONFIG.get(
+            "months_ahead",
+            8
         )
     )
 
-    monday = monday_on_or_before(
-        start
+    # Как и раньше: приблизительно N месяцев.
+    end_date = (
+        start_date
+        + timedelta(
+            days=30 * months_ahead
+        )
     )
 
-    all_events = []
+    result = []
 
-    while monday <= end:
-        print(
-            f"Загрузка недели: {monday}"
+    # Запрашиваем по неделям.
+    # Это надёжнее, чем один огромный API-запрос.
+    current = start_date
+
+    while current <= end_date:
+
+        chunk_end = min(
+            current
+            + timedelta(days=6),
+            end_date,
         )
 
-        sheet = get_sheet(
+        raw_events = get_api_events(
             group_id,
-            monday
+            current,
+            chunk_end,
         )
 
-        week_events = parse_sheet(
-            sheet,
-            monday
+        for raw_event in raw_events:
+
+            parsed = parse_api_event(
+                raw_event
+            )
+
+            if parsed is None:
+                continue
+
+            result.append(
+                parsed
+            )
+
+        current = (
+            chunk_end
+            + timedelta(days=1)
         )
 
-        print(
-            f"Найдено подходящих занятий: "
-            f"{len(week_events)}"
-        )
+    # ========================================================
+    # УДАЛЕНИЕ ДУБЛИКАТОВ
+    # ========================================================
 
-        all_events.extend(
-            week_events
-        )
-
-        monday += timedelta(
-            days=7
-        )
-
-    # Убираем полные дубликаты.
     unique = {}
 
-    for event in all_events:
-        unique[event] = event
+    for event in result:
 
-    return sorted(
-        unique.values(),
-        key=lambda x: (
-            x[0],
-            x[1],
-            x[3]
+        key = (
+            event["start"],
+            event["end"],
+            norm(
+                event["subject"]
+            ),
+            norm(
+                event["location"]
+            ),
+            norm(
+                event["educator"]
+            ),
+        )
+
+        unique[key] = event
+
+    events = list(
+        unique.values()
+    )
+
+    events.sort(
+        key=lambda event: (
+            event["start"],
+            norm(
+                event["subject"]
+            ),
         )
     )
 
+    return events
 
-def make_uid(
-    event_date,
-    start,
-    subject
-):
+
+# ============================================================
+# UID
+# ============================================================
+
+def make_uid(event):
     """
-    UID должен оставаться стабильным.
+    Стабильный UID.
 
-    Поэтому НЕ включаем:
-    - аудиторию;
-    - преподавателя;
-    - время окончания.
-
-    Если поменяется аудитория или преподаватель,
-    календарь должен обновить существующее событие,
-    а не создать второе.
+    Аудитория и преподаватель НЕ входят в UID:
+    если они поменяются, Apple Calendar должен
+    обновить существующее событие, а не создать новое.
     """
 
-    uid_base = (
-        f"{event_date.isoformat()}-"
-        f"{start.strftime('%H-%M')}-"
-        f"{norm(subject)}"
+    start = event["start"]
+
+    subject = norm(
+        event["subject"]
     )
 
-    uid_clean = re.sub(
+    base = (
+        f"{CONFIG['student_group_id']}-"
+        f"{start.strftime('%Y%m%d-%H%M')}-"
+        f"{subject}"
+    )
+
+    safe = re.sub(
         r"[^0-9A-Za-zА-Яа-яЁё_.-]+",
         "-",
-        uid_base
-    ).strip("-")
+        base
+    )
+
+    safe = safe.strip("-")
 
     return (
-        uid_clean
-        + "@spbu-calendar"
+        f"{safe}@spbu-calendar"
     )
 
 
+# ============================================================
+# ICS
+# ============================================================
+
 def make_ics(events):
+
     timezone_name = CONFIG.get(
         "timezone",
         "Europe/Moscow"
@@ -476,7 +941,7 @@ def make_ics(events):
 
     calendar.add(
         "prodid",
-        "-//SPbU Apple Calendar//RU//"
+        "-//SPbU Calendar//RU//"
     )
 
     calendar.add(
@@ -485,12 +950,12 @@ def make_ics(events):
     )
 
     calendar.add(
-        "CALSCALE",
+        "calscale",
         "GREGORIAN"
     )
 
     calendar.add(
-        "METHOD",
+        "method",
         "PUBLISH"
     )
 
@@ -515,82 +980,95 @@ def make_ics(events):
         timezone_name
     )
 
-    now = datetime.now(timezone)
+    generated_at = datetime.now(
+        timezone
+    )
 
-    for (
-        event_date,
-        start,
-        end,
-        subject,
-        place,
-        lecturer
-    ) in events:
+    for item in events:
 
         event = Event()
 
-        start_dt = datetime.combine(
-            event_date,
-            start,
-            tzinfo=timezone
-        )
-
-        end_dt = datetime.combine(
-            event_date,
-            end,
-            tzinfo=timezone
-        )
-
-        uid = make_uid(
-            event_date,
-            start,
-            subject
-        )
-
         event.add(
             "uid",
-            uid
+            make_uid(item)
         )
 
         event.add(
             "dtstamp",
-            now
+            generated_at
         )
 
         event.add(
             "last-modified",
-            now
-        )
-
-        event.add(
-            "sequence",
-            0
+            generated_at
         )
 
         event.add(
             "dtstart",
-            start_dt
+            item["start"]
         )
 
         event.add(
             "dtend",
-            end_dt
+            item["end"]
         )
 
         event.add(
             "summary",
-            subject
+            item["subject"]
         )
+
+        if item["location"]:
+
+            event.add(
+                "location",
+                item["location"]
+            )
 
         description = []
 
-        if lecturer:
+        if item["educator"]:
+
             description.append(
-                f"Преподаватель: {lecturer}"
+                "Преподаватель: "
+                + item["educator"]
             )
 
-        if place:
+        if item["location"]:
+
             description.append(
-                f"Аудитория: {place}"
+                "Место: "
+                + item["location"]
+            )
+
+        changes = []
+
+        if item[
+            "time_was_changed"
+        ]:
+            changes.append(
+                "изменено время"
+            )
+
+        if item[
+            "location_was_changed"
+        ]:
+            changes.append(
+                "изменено место"
+            )
+
+        if item[
+            "educator_was_changed"
+        ]:
+            changes.append(
+                "изменён преподаватель"
+            )
+
+        if changes:
+
+            description.append(
+                "Изменения: "
+                + ", ".join(changes)
             )
 
         description.append(
@@ -599,14 +1077,10 @@ def make_ics(events):
 
         event.add(
             "description",
-            "\n".join(description)
-        )
-
-        if place:
-            event.add(
-                "location",
-                place
+            "\n".join(
+                description
             )
+        )
 
         calendar.add_component(
             event
@@ -615,7 +1089,34 @@ def make_ics(events):
     return calendar.to_ical()
 
 
+# ============================================================
+# MAIN
+# ============================================================
+
 def main():
+
+    print(
+        "=" * 60
+    )
+
+    print(
+        "СПбГУ -> iCalendar"
+    )
+
+    print(
+        "Источник: официальный API timetable.spbu.ru"
+    )
+
+    print(
+        f"Группа: "
+        f"{CONFIG.get('group_name', '')} "
+        f"(ID {CONFIG['student_group_id']})"
+    )
+
+    print(
+        "=" * 60
+    )
+
     events = load_schedule()
 
     output = (
@@ -635,11 +1136,21 @@ def main():
 
     print()
     print(
-        f"Создано событий: {len(events)}"
+        "=" * 60
     )
 
     print(
-        f"Файл: {output}"
+        f"Добавлено событий: "
+        f"{len(events)}"
+    )
+
+    print(
+        f"Готовый файл: "
+        f"{output}"
+    )
+
+    print(
+        "=" * 60
     )
 
 
