@@ -31,7 +31,7 @@ def is_selected_subject(subject):
     """
     Оставляем:
     - все обычные предметы;
-    - только выбранный электив "Теория игр".
+    - только выбранные элективы.
 
     Убираем:
     - все остальные элективы;
@@ -47,7 +47,7 @@ def is_selected_subject(subject):
     if s.startswith("факультатив"):
         return False
 
-    # Элективы:
+    # Элективы.
     if s.startswith("электив"):
         selected_electives = [
             norm(x)
@@ -94,8 +94,6 @@ def get_sheet(group_id, monday):
             "СПбГУ вернул Excel без листов."
         )
 
-    # Берём первый лист, потому что название листа
-    # может меняться в разных версиях выгрузки.
     return workbook[workbook.sheetnames[0]]
 
 
@@ -140,10 +138,7 @@ def parse_day(value, monday):
         вторник
         8 сентября
 
-    Поэтому дата не берётся из ячейки напрямую.
-
-    День недели + номер дня позволяют получить
-    реальную дату относительно недели.
+    Поэтому дата определяется относительно недели.
     """
 
     if not value:
@@ -174,7 +169,9 @@ def parse_day(value, monday):
         return None
 
     match = re.search(
-        r"\b(\d{1,2})\s+(января|февраля|марта|апреля|мая|июня|июля|августа|сентября|октября|ноября|декабря)\b",
+        r"\b(\d{1,2})\s+"
+        r"(января|февраля|марта|апреля|мая|июня|"
+        r"июля|августа|сентября|октября|ноября|декабря)\b",
         text
     )
 
@@ -200,7 +197,6 @@ def parse_day(value, monday):
 
     month = months[match.group(2)]
 
-    # Определяем год из понедельника недели.
     year = monday.year
 
     # Если неделя пересекает Новый год.
@@ -216,127 +212,142 @@ def parse_day(value, monday):
     except ValueError:
         return None
 
-    # Дополнительная проверка.
-    # Дата должна соответствовать нужному дню недели.
+    # Проверяем, что дата соответствует дню недели.
     if result.weekday() != weekday:
         return None
 
     return result
 
 
-def parse_sheet(sheet):
+def cell_is_struck(cell):
+    """
+    Возвращает True, если текст в ячейке Excel зачёркнут.
+    """
 
-    rows = []
+    try:
+        return bool(cell.font and cell.font.strike)
+    except Exception:
+        return False
 
-    for row in sheet.iter_rows(min_row=5, max_row=300, max_col=5):
 
-        values = []
+def row_is_cancelled(row):
+    """
+    СПбГУ отмечает отменённые занятия зачёркиванием.
 
-        # Если хотя бы одна существенная ячейка занятия зачёркнута,
+    Проверяем время, название, аудиторию и преподавателя.
+    Первая колонка содержит день недели, поэтому её не учитываем.
+    """
 
-        # считаем занятие отменённым.
+    important_cells = row[1:5]
 
-        cancelled = any(
+    for cell in important_cells:
+        if cell.value is None:
+            continue
 
-            bool(c.font.strike)
+        if cell_is_struck(cell):
+            return True
 
-            for c in row[1:5]
+    return False
 
-            if c.value is not None
 
-        )
-
-        for c in row:
-
-            v = c.value
-
-            values.append(
-
-                str(v).replace("\n", " ").strip()
-
-                if v is not None
-
-                else None
-
-            )
-
-        if any(values):
-
-            rows.append((values, cancelled))
-
-    last_day = None
-
+def parse_sheet(sheet, monday):
     result = []
 
-    for row, cancelled in rows:
+    current_day = None
 
-        if row[0]:
+    for row in sheet.iter_rows(
+        min_row=1,
+        max_row=500,
+        max_col=5
+    ):
+        values = []
 
-            last_day = row[0]
+        for cell in row:
+            value = cell.value
 
-        if len(row) < 5 or not row[1] or not row[2]:
+            if value is not None:
+                value = str(value)
+                value = value.replace("\xa0", " ")
+                value = value.strip()
 
+            values.append(value)
+
+        if not any(values):
             continue
 
-        if not last_day:
+        first = values[0] or ""
 
+        # Если в первой ячейке указан день,
+        # запоминаем его для следующих строк.
+        parsed_day = parse_day(
+            first,
+            monday
+        )
+
+        if parsed_day:
+            current_day = parsed_day
+
+        # Структура:
+        # 0 — день
+        # 1 — время
+        # 2 — название
+        # 3 — место
+        # 4 — преподаватель
+
+        if not current_day:
             continue
 
-        # Отменённую пару в календарь не добавляем
-
-        if cancelled:
-
-            print(f"Пропускаю отменённое занятие: {row[2]}")
-
+        if len(values) < 5:
             continue
 
-        # Example: "Понедельник 07.09.2026"
+        time_value = values[1]
+        subject = values[2]
 
-        m = re.search(r"(\d{2}\.\d{2}\.\d{4})", last_day)
-
-        if not m:
-
+        if not time_value or not subject:
             continue
 
-        try:
+        parsed_time = parse_time(
+            time_value
+        )
 
-            d = datetime.strptime(m.group(1), "%d.%m.%Y").date()
-
-        except ValueError:
-
+        if not parsed_time:
             continue
 
-        tm = str(row[1]).replace("—", "–").replace("-", "–")
+        start, end = parsed_time
 
-        parts = [x.strip() for x in tm.split("–")]
+        # ----------------------------------------
+        # ПРОВЕРКА НА ОТМЕНУ
+        # ----------------------------------------
 
-        if len(parts) != 2:
-
-            continue
-
-        try:
-
-            start = datetime.strptime(parts[0], "%H:%M").time()
-
-            end = datetime.strptime(parts[1], "%H:%M").time()
-
-        except ValueError:
-
-            continue
-
-        subject = row[2] or ""
-
-        place = row[3] or ""
-
-        lecturer = row[4] or ""
-
-        if selected(subject):
-
-            result.append(
-
-                (d, start, end, subject, place, lecturer)
-
+        if row_is_cancelled(row):
+            print(
+                "Отменённое занятие пропущено: "
+                f"{current_day} "
+                f"{start.strftime('%H:%M')} "
+                f"{subject}"
             )
+            continue
+
+        # ----------------------------------------
+        # ФИЛЬТРАЦИЯ ПРЕДМЕТОВ
+        # ----------------------------------------
+
+        if not is_selected_subject(subject):
+            continue
+
+        place = values[3] or ""
+        lecturer = values[4] or ""
+
+        result.append(
+            (
+                current_day,
+                start,
+                end,
+                subject,
+                place,
+                lecturer
+            )
+        )
 
     return result
 
@@ -372,7 +383,6 @@ def load_schedule():
     all_events = []
 
     while monday <= end:
-
         print(
             f"Загрузка недели: {monday}"
         )
@@ -400,7 +410,7 @@ def load_schedule():
             days=7
         )
 
-    # Убираем дубликаты.
+    # Убираем полные дубликаты.
     unique = {}
 
     for event in all_events:
@@ -413,6 +423,42 @@ def load_schedule():
             x[1],
             x[3]
         )
+    )
+
+
+def make_uid(
+    event_date,
+    start,
+    subject
+):
+    """
+    UID должен оставаться стабильным.
+
+    Поэтому НЕ включаем:
+    - аудиторию;
+    - преподавателя;
+    - время окончания.
+
+    Если поменяется аудитория или преподаватель,
+    календарь должен обновить существующее событие,
+    а не создать второе.
+    """
+
+    uid_base = (
+        f"{event_date.isoformat()}-"
+        f"{start.strftime('%H-%M')}-"
+        f"{norm(subject)}"
+    )
+
+    uid_clean = re.sub(
+        r"[^0-9A-Za-zА-Яа-яЁё_.-]+",
+        "-",
+        uid_base
+    ).strip("-")
+
+    return (
+        uid_clean
+        + "@spbu-calendar"
     )
 
 
@@ -469,6 +515,8 @@ def make_ics(events):
         timezone_name
     )
 
+    now = datetime.now(timezone)
+
     for (
         event_date,
         start,
@@ -492,21 +540,10 @@ def make_ics(events):
             tzinfo=timezone
         )
 
-        uid_base = (
-            f"{event_date.isoformat()}-"
-            f"{start}-{end}-"
-            f"{subject}-"
-            f"{place}-"
-            f"{lecturer}"
-        )
-
-        uid = (
-            re.sub(
-                r"[^0-9A-Za-zА-Яа-я_.-]+",
-                "-",
-                uid_base
-            ).strip("-")
-            + "@spbu-calendar"
+        uid = make_uid(
+            event_date,
+            start,
+            subject
         )
 
         event.add(
@@ -516,7 +553,17 @@ def make_ics(events):
 
         event.add(
             "dtstamp",
-            datetime.now(timezone)
+            now
+        )
+
+        event.add(
+            "last-modified",
+            now
+        )
+
+        event.add(
+            "sequence",
+            0
         )
 
         event.add(
@@ -586,6 +633,7 @@ def main():
         make_ics(events)
     )
 
+    print()
     print(
         f"Создано событий: {len(events)}"
     )
